@@ -272,6 +272,40 @@ class _DSU:
             self.p[rb] = ra
 
 
+def _deskew_word(word_id: Any, text: str, confidence: Optional[float],
+                 raw_pts: List[Point], m: Dict[str, Any], skew: float) -> Word:
+    """由原始角点度量与整页倾斜角构建校正坐标系下的 :class:`Word`。
+
+    analyze_layout 与质量报告共用此函数，保证两边看到的词框几何完全一致。
+    """
+    theta = math.radians(-skew)  # 反向旋转校正
+    cx, cy = _rotate(m["center"][0], m["center"][1], theta)
+    rot_pts = [_rotate(x, y, theta) for x, y in raw_pts]
+    xs = [p[0] for p in rot_pts]
+    ys = [p[1] for p in rot_pts]
+    # 旋转后词宽 = 长边在水平方向的投影，近似用 |(w*cos, w*sin)|
+    w = m["width"]
+    h = m["height"]
+    a = math.radians(m["angle"] - skew)
+    width = abs(w * math.cos(a)) + abs(h * math.sin(a))
+    height = abs(w * math.sin(a)) + abs(h * math.cos(a))
+    return Word(
+        index=word_id,
+        text=text,
+        confidence=confidence,
+        quad=raw_pts,
+        cx=cx,
+        cy=cy,
+        left=min(xs),
+        right=max(xs),
+        top=min(ys),
+        bottom=max(ys),
+        width=max(width, 1e-6),
+        height=max(height, 1e-6),
+        angle=_wrap_angle(math.degrees(a)),
+    )
+
+
 def _cluster_lines(words: List[Word], page_width: float) -> List[Line]:
     """把词框聚成文本行。
 
@@ -596,34 +630,9 @@ def analyze_layout(page_width: float, page_height: float,
         metrices.append(m)
 
     skew = _estimate_skew(metrices)
-    theta = math.radians(-skew)  # 反向旋转校正
 
     for idx, word_id, text, conf, raw_pts, m in measured:
-        cx, cy = _rotate(m["center"][0], m["center"][1], theta)
-        rot_pts = [_rotate(x, y, theta) for x, y in raw_pts]
-        xs = [p[0] for p in rot_pts]
-        ys = [p[1] for p in rot_pts]
-        # 旋转后词宽 = 长边在水平方向的投影，近似用 |(w*cos, w*sin)|
-        w = m["width"]
-        h = m["height"]
-        a = math.radians(m["angle"] - skew)
-        width = abs(w * math.cos(a)) + abs(h * math.sin(a))
-        height = abs(w * math.sin(a)) + abs(h * math.cos(a))
-        valid.append(Word(
-            index=word_id,
-            text=text,
-            confidence=conf,
-            quad=raw_pts,
-            cx=cx,
-            cy=cy,
-            left=min(xs),
-            right=max(xs),
-            top=min(ys),
-            bottom=max(ys),
-            width=max(width, 1e-6),
-            height=max(height, 1e-6),
-            angle=_wrap_angle(math.degrees(a)),
-        ))
+        valid.append(_deskew_word(word_id, text, conf, raw_pts, m, skew))
 
     lines = _cluster_lines(valid, max(page_width, 1e-6))
     median_h = statistics.median([w.height for w in valid]) if valid else 0.0

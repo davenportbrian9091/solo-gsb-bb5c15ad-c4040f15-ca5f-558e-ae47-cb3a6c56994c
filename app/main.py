@@ -9,7 +9,8 @@ from typing import Any, Dict
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from . import db
-from .schemas import SortRequest, TaskCreated, TaskStatus
+from .quality import build_quality_report
+from .schemas import QualityReport, SortRequest, TaskCreated, TaskStatus
 from .worker import process_task
 
 
@@ -71,3 +72,25 @@ def get_task(task_id: str) -> Dict[str, Any]:
     if row is None:
         raise HTTPException(status_code=404, detail="task not found")
     return _serialize(row)
+
+
+@app.post("/api/tasks/{task_id}/quality-report", response_model=QualityReport)
+def quality_report(task_id: str) -> Dict[str, Any]:
+    """对已完成任务生成词框质量报告。
+
+    读取任务原始词框与已落库的行分组，按行内字号中位数/MAD、相邻间距与
+    置信度做确定性异常检测；不写库、不改写任务结果。任务不存在返回 404，
+    任务尚未完成（pending/processing/failed）返回 409。
+    """
+    row = db.get_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if row["status"] != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=f"task not finished: status={row['status']}",
+        )
+    request_payload = json.loads(row["request_json"])
+    result = json.loads(row["result_json"])
+    report = build_quality_report(request_payload, result)
+    return {"task_id": task_id, **report}

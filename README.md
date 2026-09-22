@@ -40,6 +40,10 @@ curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
+镜像内置词框质量报告接口（`POST /api/tasks/{task_id}/quality-report`），
+报告按请求实时计算，无需额外环境变量、数据库迁移或卷；历史任务只要在
+`/data/ocr_sort.db` 中处于 `done` 状态即可直接生成报告。
+
 停止：
 
 ```bash
@@ -96,6 +100,61 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `ordered_text`：最终有序文本，行内换行、块之间空一行；
 - `unclassified[]`：无法归类的词框（空文本 `empty_text`、退化/非法四角 `invalid_quad`），
   附带原始 `id`、`text`、`confidence`、`quad` 与 `reason`。
+
+### `POST /api/tasks/{task_id}/quality-report` — 词框质量报告
+
+对 **`status=done`** 的任务做只读的确定性质检：读取任务的**原始词框**与已落库的
+**行分组**，在与排序完全相同的去倾斜坐标系下逐行检查异常词框。报告**实时计算、不写库、
+不改写任务结果**，同样的任务多次请求结果逐字节一致。
+
+检测规则（阈值为服务端固定常量，不依赖随机量）：
+
+| `kind` | 判定规则 | 触发位置 |
+| --- | --- | --- |
+| `low_confidence` | 置信度 `<0.50` 记 `high`，`<0.75` 记 `medium`；未提供置信度不检查 | 单个词框 |
+| `size_outlier` | 词高相对**行内字号中位数**的稳健 z 分数（**MAD×1.4826**；MAD 退化时取行中位字高的 18%）`≥3.5` 记 `medium`、`≥6` 记 `high`；行内词数 ≥3 才检查 | 单个词框 |
+| `overlap` | 行内相邻词**垂直重叠 ≥50%** 且水平侵入较窄词宽度 `≥15%` 记 `medium`、`≥50%` 记 `high`；词对双方各一条 issue | 相邻词对 |
+| `gap_anomaly` | 行内相邻水平间距相对**行内间距中位数**的稳健 z 分数（MAD 退化时尺度取 0.25 倍中位字高）`≥3.5`/`≥6`；仅检查偏大间隙（侵入由 overlap 负责），issue 挂在间隙左侧词，行内间距数 ≥2 才检查 | 相邻词对 |
+
+`200` 响应：
+
+```json
+{
+  "task_id": "5f1c…",
+  "issues": [
+    {
+      "word_id": 1,
+      "line_id": 0,
+      "kind": "low_confidence",
+      "severity": "high",
+      "reason": "OCR 置信度 0.400 低于阈值 0.75",
+      "suggestion": "建议人工复核该词的识别文本与四角坐标"
+    }
+  ],
+  "summary": {
+    "total": 1,
+    "by_kind": {"low_confidence": 1, "size_outlier": 0, "overlap": 0, "gap_anomaly": 0},
+    "by_severity": {"high": 1, "medium": 0, "low": 0},
+    "lines_checked": 1,
+    "words_checked": 3,
+    "unclassified_count": 0
+  }
+}
+```
+
+- `issues[]` 按词框**原始 id 升序**排列（未提供 id 的词框排在最后，其 `word_id` 为
+  `null`）；每个 issue 含 `word_id`、`line_id`（结果行 `order`）、`kind`、`severity`、
+  `reason`（含量化指标）、`suggestion`；
+- 行内正常的排版波动不会产生 issue；未归行词框（`unclassified`）不参与行内检查，
+  仅在 `summary.unclassified_count` 中计数。
+
+错误沿用统一结构：任务不存在返回 `404 {"detail": "task not found"}`；
+任务未完成（`pending` / `processing` / `failed`）返回
+`409 {"detail": "task not finished: status=<status>"}`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/tasks/<TASK_ID>/quality-report
+```
 
 ## 示例请求
 
@@ -156,15 +215,19 @@ pytest -q
 ```
 
 测试覆盖：单栏顺序、双栏/三栏列优先顺序、跨栏标题、倾斜页面、行距不均、
-标题/页脚区域切分、行内基线排序、无法归类词框、CJK 文本拼接与 HTTP 全流程。
+标题/页脚区域切分、行内基线排序、无法归类词框、CJK 文本拼接、
+质量报告四类异常规则（低置信/字号离群/重叠/间隙异常）及其确定性与只读性、
+HTTP 全流程（含 404/409 统一错误结构）。
 
 ## 项目结构
 
 ```
 app/
-  main.py      FastAPI 入口（POST /api/tasks、GET /api/tasks/{id}、/health）
+  main.py      FastAPI 入口（POST /api/tasks、GET /api/tasks/{id}、
+               POST /api/tasks/{id}/quality-report、/health）
   schemas.py   Pydantic 请求/响应模型与入参校验
   layout.py    版面几何算法（去倾斜 / 行聚类 / 基线排序 / XY-cut / 结果组装）
+  quality.py   词框质量报告（中位数/MAD 稳健离群、重叠与间隙检测，确定性只读）
   worker.py    后台任务执行（线程池）
   db.py        SQLite 持久化（SQLAlchemy Core）
 examples/
