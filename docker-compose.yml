@@ -1,0 +1,15 @@
+services:
+  ocr-sort:
+    build: .
+    image: ocr-layout-sort:latest
+    container_name: ocr-layout-sort
+    ports:
+      - "8000:8000"
+    volumes:
+      - ocr-data:/data
+    environment:
+      OCR_DB_PATH: /data/ocr_sort.db
+    restart: unless-stopped
+
+volumes:
+  ocr-data:
