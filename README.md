@@ -24,7 +24,8 @@ docker compose up --build -d
 ```
 
 服务监听 **端口 `8000`**，SQLite 数据库保存在命名卷 `ocr-data`（容器内 `/data/ocr_sort.db`），
-容器重建后任务历史仍在。
+容器重建后任务历史仍在。镜像只含 `app/` 代码、无需额外依赖，
+`POST /api/tasks/{id}/quality-report` 为只读分析，不产生新文件、也不写入数据库。
 
 不用 Compose 也可以：
 
@@ -97,6 +98,72 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `unclassified[]`：无法归类的词框（空文本 `empty_text`、退化/非法四角 `invalid_quad`），
   附带原始 `id`、`text`、`confidence`、`quad` 与 `reason`。
 
+### `POST /api/tasks/{task_id}/quality-report` — 词框质量报告
+
+对**已完成**（`done`）任务做只读质量分析：读取结果中的原始词框与行分组，
+在去倾斜坐标系下重新测量，按固定、确定性的规则识别异常词框，
+**不会修改或重算任务结果**，同一任务重复调用得到完全相同的报告。
+
+无需请求体。任务不存在返回 `404 {"detail":"task not found"}`；
+任务尚未完成（`pending` / `processing` / `failed`）返回
+`409 {"detail":"task not ready (status=…)"}`，与其他接口的统一错误结构一致。
+
+`200` 响应中 `issues[]` **按词框原始 id 排序**（同 id 再按规则类型、行号），每项含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `word_id` / `line_id` | 异常词框的原始 id，及其所属文本行 id（排序结果中的行号） |
+| `kind` | 异常类别（见下表） |
+| `severity` | `major`（严重）/ `minor`（提示） |
+| `reason` | 判定依据，包含实际测量值与阈值 |
+| `suggestion` | 建议的人工处理方式 |
+
+异常类别与确定性规则（阈值内置、版本见响应 `rules_version`）：
+
+| kind | 规则 |
+| --- | --- |
+| `low_confidence` | 置信度 `<0.50` 为 major，`<0.75` 为 minor；未提供置信度不判断 |
+| `size_outlier` | 行内 ≥3 个词时，词高对本行字号中位数的稳健离群：MAD z 分数 ≥3.5/≥2.5；MAD 退化为 0（行内字号一致）时改用相对偏差 ≥50%/≥30% |
+| `overlap` | 同行两词垂直重叠 ≥50%（按较矮词）且水平重叠 ≥25%（按较窄词）为 minor，≥50% 为 major；两词各记一条 |
+| `gap_anomaly` | 行内 ≥4 个词时，相邻词正间距相对本行间距中位数显著偏大：MAD z 分数 ≥3.5/≥2.5；MAD 为 0 且间隙 ≥1 倍字高时改用中位倍数 ≥4/≥2.5；问题记在左侧词 |
+
+`summary` 给出计数：`total_issues`、`words_with_issues`（命中规则的词数，
+一个词可有多条 issue）、`scanned_words`、`scanned_lines`、
+`unclassified_words`（排序阶段就被剔除的词框数）、
+以及 `by_kind` / `by_severity` 分类计数。
+
+```bash
+# 任务 done 之后
+curl -s -X POST http://localhost:8000/api/tasks/<TASK_ID>/quality-report
+```
+
+```json
+{
+  "task_id": "<TASK_ID>",
+  "rules_version": "1.0",
+  "issues": [
+    {
+      "word_id": 7,
+      "line_id": 2,
+      "kind": "low_confidence",
+      "severity": "major",
+      "reason": "置信度 0.40 低于阈值 0.50",
+      "suggestion": "OCR 识别很可能不可靠，建议对照原图人工复核该词"
+    }
+  ],
+  "summary": {
+    "total_issues": 1,
+    "words_with_issues": 1,
+    "scanned_words": 42,
+    "scanned_lines": 8,
+    "unclassified_words": 0,
+    "by_kind": {"low_confidence": 1, "size_outlier": 0,
+                "overlap": 0, "gap_anomaly": 0},
+    "by_severity": {"major": 1, "minor": 0}
+  }
+}
+```
+
 ## 示例请求
 
 仓库内置一个带跨栏标题、左右双栏（含中文）、页码并整体倾斜 1.5° 的示例：
@@ -156,15 +223,20 @@ pytest -q
 ```
 
 测试覆盖：单栏顺序、双栏/三栏列优先顺序、跨栏标题、倾斜页面、行距不均、
-标题/页脚区域切分、行内基线排序、无法归类词框、CJK 文本拼接与 HTTP 全流程。
+标题/页脚区域切分、行内基线排序、无法归类词框、CJK 文本拼接、
+质量报告四类异常（低置信/字号离群/重叠/行内间隙）与排序稳定性/错误码，
+以及 HTTP 全流程。
 
 ## 项目结构
 
 ```
 app/
-  main.py      FastAPI 入口（POST /api/tasks、GET /api/tasks/{id}、/health）
+  main.py      FastAPI 入口（POST /api/tasks、GET /api/tasks/{id}、
+               POST /api/tasks/{id}/quality-report、/health）
   schemas.py   Pydantic 请求/响应模型与入参校验
   layout.py    版面几何算法（去倾斜 / 行聚类 / 基线排序 / XY-cut / 结果组装）
+  quality.py   词框质量报告（只读、确定性异常检测：置信度 / 字号 MAD /
+               重叠 / 行内间距）
   worker.py    后台任务执行（线程池）
   db.py        SQLite 持久化（SQLAlchemy Core）
 examples/
